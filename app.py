@@ -1,5 +1,6 @@
 import os
 import re
+import hashlib
 from pathlib import Path
 
 import faiss
@@ -71,33 +72,51 @@ def normalize_text(text: str) -> str:
     return text.strip()
 
 
+def _valid_pdf(path: Path) -> bool:
+    """Return True only when the file looks like a real PDF."""
+    if not path.exists() or path.stat().st_size < 10_000:
+        return False
+    try:
+        with path.open("rb") as f:
+            return f.read(5) == b"%PDF-"
+    except OSError:
+        return False
+
+
 def download_source_pdf() -> str:
-    """Download the user's Google Drive PDF if it is not already present."""
-    if PDF_PATH.exists() and PDF_PATH.stat().st_size > 10_000:
+    """Download the Google Drive PDF using gdown's Drive-aware downloader."""
+    if _valid_pdf(PDF_PATH):
         return str(PDF_PATH)
 
-    drive_url = f"https://drive.google.com/uc?id={DRIVE_FILE_ID}"
+    # The ID-based URL is more reliable than passing the /view URL to gdown.
+    urls = [
+        f"https://drive.google.com/uc?id={DRIVE_FILE_ID}",
+        f"https://drive.google.com/file/d/{DRIVE_FILE_ID}/view?usp=sharing",
+    ]
+    errors = []
 
-    try:
-        output = gdown.download(
-            drive_url,
-            str(PDF_PATH),
-            quiet=False,
-            fuzzy=True,
-        )
-    except Exception as exc:
-        raise RuntimeError(
-            "Could not download the cyber-law PDF from Google Drive. "
-            "Make sure the Drive file is accessible to anyone with the link."
-        ) from exc
+    for url in urls:
+        try:
+            if PDF_PATH.exists():
+                PDF_PATH.unlink()
+            output = gdown.download(
+                url=url,
+                output=str(PDF_PATH),
+                quiet=True,
+                fuzzy=True,
+            )
+            if output and _valid_pdf(PDF_PATH):
+                return str(PDF_PATH)
+            errors.append("Google Drive returned a non-PDF or incomplete file")
+        except Exception as exc:
+            errors.append(str(exc))
 
-    if not output or not PDF_PATH.exists() or PDF_PATH.stat().st_size < 10_000:
-        raise RuntimeError(
-            "The PDF download did not complete correctly. "
-            "Check that the Google Drive file is shared as 'Anyone with the link'."
-        )
-
-    return str(PDF_PATH)
+    raise RuntimeError(
+        "Google Drive did not provide the PDF. Set the file to "
+        "General access → Anyone with the link → Viewer, then redeploy. "
+        "If your organization blocks public Drive files, use the PDF upload "
+        "fallback in the sidebar. Details: " + " | ".join(errors[-2:])
+    )
 
 
 def split_into_chunks(text: str, chunk_size: int = 1200, overlap: int = 180):
@@ -172,12 +191,8 @@ def extract_pdf_chunks(pdf_path: str):
 
 
 @st.cache_resource(show_spinner=False)
-def build_knowledge_base():
-    """
-    Download PDF and build FAISS index once per Streamlit process.
-    Streamlit Cloud can rebuild this cache after a restart/redeploy.
-    """
-    pdf_path = download_source_pdf()
+def build_knowledge_base(pdf_path: str, pdf_signature: str):
+    """Build the FAISS knowledge base for the selected PDF."""
     chunks = extract_pdf_chunks(pdf_path)
 
     model = SentenceTransformer(EMBEDDING_MODEL)
@@ -448,11 +463,52 @@ with st.sidebar:
         st.rerun()
 
 # -----------------------------
-# Build / load RAG
+# Source PDF / build RAG
 # -----------------------------
+st.sidebar.divider()
+st.sidebar.subheader("📄 Knowledge source")
+st.sidebar.caption(
+    "CyberlawGPT first tries the configured Google Drive PDF. "
+    "If Drive permissions block server-side download, upload the same PDF here."
+)
+
+uploaded_pdf = st.sidebar.file_uploader(
+    "Upload cyber-law PDF (fallback)",
+    type=["pdf"],
+    help="Use this when Google Drive does not allow public server-side downloads.",
+)
+
+selected_pdf = None
+if uploaded_pdf is not None:
+    uploaded_path = Path("uploaded_cyber_law_source.pdf")
+    data = uploaded_pdf.getvalue()
+    if len(data) < 10_000 or not data.startswith(b"%PDF-"):
+        st.sidebar.error("The uploaded file does not appear to be a valid PDF.")
+    else:
+        uploaded_path.write_bytes(data)
+        selected_pdf = uploaded_path
+else:
+    try:
+        selected_pdf = Path(download_source_pdf())
+    except Exception as drive_exc:
+        st.warning(
+            "Google Drive download is unavailable. Upload the cyber-law PDF "
+            "from the sidebar to continue without changing the application code."
+        )
+        st.caption(f"Drive diagnostic: {drive_exc}")
+
+if selected_pdf is None:
+    st.stop()
+
+pdf_signature = hashlib.sha256(
+    selected_pdf.read_bytes()
+).hexdigest()
+
 try:
-    with st.spinner("Loading cyber-law PDF and building FAISS embeddings..."):
-        embedding_model, faiss_index, chunks, chunk_count = build_knowledge_base()
+    with st.spinner("Reading cyber-law PDF and building FAISS embeddings..."):
+        embedding_model, faiss_index, chunks, chunk_count = build_knowledge_base(
+            str(selected_pdf), pdf_signature
+        )
 
     col1, col2, col3 = st.columns(3)
     col1.metric("Indexed passages", chunk_count)
