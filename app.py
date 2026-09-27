@@ -23,16 +23,20 @@ APP_NAME = "CyberlawGPT"
 
 NCCIA_LAWS_URL = "https://nccia.gov.pk/laws.php"
 
-# Official fallback sources.
-# These are used if the NCCIA page blocks automated downloading.
-FALLBACK_SOURCES = [
+OFFICIAL_SOURCES = [
     {
         "name": "Prevention of Electronic Crimes Act 2016",
-        "url": "https://www.pakistancode.gov.pk/pdffiles/administrator6a061efe0ed5bd153fa8b79b8eb4cba7.pdf",
+        "url": (
+            "https://www.pakistancode.gov.pk/"
+            "pdffiles/administrator6a061efe0ed5bd153fa8b79b8eb4cba7.pdf"
+        ),
     },
     {
-        "name": "PECA Amendment Act 2025",
-        "url": "https://www.senate.gov.pk/uploads/documents/1738226500_897.pdf",
+        "name": "Prevention of Electronic Crimes Amendment Act 2025",
+        "url": (
+            "https://senate.gov.pk/uploads/documents/"
+            "1737697316_896.pdf"
+        ),
     },
 ]
 
@@ -131,30 +135,47 @@ def clean_text(text: str) -> str:
     return text.strip()
 
 
-def download_pdf(url: str, timeout: int = 30) -> bytes:
-    """Download PDF bytes."""
+def download_pdf(url: str, timeout: int = 60) -> bytes:
     headers = {
         "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 Chrome/130 Safari/537.36"
-        )
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/153.0.0.0 Safari/537.36"
+        ),
+        "Accept": (
+            "application/pdf,application/octet-stream,"
+            "text/html;q=0.9,*/*;q=0.8"
+        ),
+        "Referer": NCCIA_LAWS_URL,
+        "Connection": "keep-alive",
     }
 
     response = requests.get(
         url,
         headers=headers,
         timeout=timeout,
+        allow_redirects=True,
     )
 
     response.raise_for_status()
 
-    content_type = response.headers.get("content-type", "").lower()
+    data = response.content
 
-    # Some government servers don't return a proper application/pdf type.
-    if not response.content.startswith(b"%PDF") and "pdf" not in content_type:
-        raise ValueError("Downloaded file does not appear to be a PDF.")
+    if data.startswith(b"%PDF"):
+        return data
 
-    return response.content
+    # Some servers return PDF with unusual headers.
+    content_type = response.headers.get(
+        "content-type", ""
+    ).lower()
+
+    if "pdf" in content_type:
+        return data
+
+    raise ValueError(
+        f"Expected PDF but received "
+        f"{content_type or 'unknown content type'}"
+    )
 
 
 def extract_pdf_text(pdf_bytes: bytes) -> str:
@@ -244,62 +265,144 @@ def discover_nccia_pdfs() -> List[Dict[str, str]]:
     return list(unique.values())
 
 
-def download_law_documents() -> List[Dict[str, str]]:
+def download_law_documents():
     """
-    Download cyber-law documents.
+    Download Pakistani cyber-law documents.
 
-    First tries NCCIA's official laws page.
-    If automated access fails, uses official government
-    fallback documents.
+    Strategy:
+
+    1. Try the NCCIA cyber-laws page.
+    2. If NCCIA blocks automated access, do NOT fail.
+    3. Use official government copies from Pakistan Code
+       and Senate of Pakistan.
     """
 
     documents = []
 
+    # --------------------------------------------------------
+    # STEP 1 — Try NCCIA
+    # --------------------------------------------------------
+
     try:
-        discovered = discover_nccia_pdfs()
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 Chrome/153.0.0.0 Safari/537.36"
+            ),
+            "Accept": "text/html,application/xhtml+xml",
+        }
 
-        for item in discovered:
-            try:
-                pdf_bytes = download_pdf(item["url"])
+        response = requests.get(
+            NCCIA_LAWS_URL,
+            headers=headers,
+            timeout=30,
+        )
 
-                text = extract_pdf_text(pdf_bytes)
+        if response.status_code == 200:
 
-                if len(text) > 500:
-                    documents.append(
-                        {
-                            "name": item["name"],
-                            "url": item["url"],
-                            "text": text,
-                        }
+            pdf_links = re.findall(
+                r'href\s*=\s*["\']([^"\']+)["\']',
+                response.text,
+                flags=re.IGNORECASE,
+            )
+
+            for link in pdf_links:
+
+                if ".pdf" not in link.lower():
+                    continue
+
+                if link.startswith("//"):
+                    link = "https:" + link
+
+                elif link.startswith("/"):
+                    link = "https://nccia.gov.pk" + link
+
+                elif not link.startswith("http"):
+                    link = (
+                        "https://nccia.gov.pk/"
+                        + link
                     )
 
-            except Exception:
-                continue
+                try:
+
+                    pdf_bytes = download_pdf(link)
+
+                    text = extract_pdf_text(
+                        pdf_bytes
+                    )
+
+                    if len(text) > 500:
+
+                        documents.append(
+                            {
+                                "name": os.path.basename(
+                                    link.split("?")[0]
+                                ),
+                                "url": link,
+                                "text": text,
+                            }
+                        )
+
+                except Exception:
+                    continue
 
     except Exception:
+        # NCCIA may return 403.
+        # Continue to official government sources.
         pass
 
-    # If NCCIA discovery did not provide usable PDFs,
-    # use official fallback sources.
+    # --------------------------------------------------------
+    # STEP 2 — Official government sources
+    # --------------------------------------------------------
+
+    already_loaded = {
+        x["url"]
+        for x in documents
+    }
+
+    for source in OFFICIAL_SOURCES:
+
+        if source["url"] in already_loaded:
+            continue
+
+        try:
+
+            pdf_bytes = download_pdf(
+                source["url"]
+            )
+
+            text = extract_pdf_text(
+                pdf_bytes
+            )
+
+            if len(text) > 500:
+
+                documents.append(
+                    {
+                        "name": source["name"],
+                        "url": source["url"],
+                        "text": text,
+                    }
+                )
+
+        except Exception as error:
+
+            print(
+                f"Could not load "
+                f"{source['name']}: {error}"
+            )
+
+    # --------------------------------------------------------
+    # STEP 3 — Final validation
+    # --------------------------------------------------------
+
     if not documents:
 
-        for item in FALLBACK_SOURCES:
-
-            try:
-                pdf_bytes = download_pdf(item["url"])
-                text = extract_pdf_text(pdf_bytes)
-
-                if len(text) > 500:
-                    documents.append(
-                        {
-                            "name": item["name"],
-                            "url": item["url"],
-                            "text": text,
-                        }
-                    )
-
-            except Exception:
-                continue
+        raise RuntimeError(
+            "No Pakistani cyber-law documents could be downloaded. "
+            "NCCIA may be temporarily blocking automated requests "
+            "or the official government sources may be unavailable."
+        )
 
     return documents
 
